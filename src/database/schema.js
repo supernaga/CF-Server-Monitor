@@ -1,5 +1,5 @@
 let dbInitialized = false;
-const DELETE_RAW_DATA = false; // 是否删除1天内的原始数据和中间聚合数据。超过1天的数据无论此设置如何都会被删除
+const DELETE_RAW_DATA = false; // true:删除超过1天的原始数据; false:删除超过3天的原始数据; 都不删除1天内的原始数据
 const RETENTION_DAYS = 1; // 数据保留天数（原始数据和聚合数据都保留此天数）
 
 export async function initDatabase(db) {
@@ -226,6 +226,9 @@ async function aggregateFromRaw(db, startTime, endTime, bucketSeconds, phaseName
   const bucketMs = bucketSeconds * 1000;
   const now = Date.now();
   const oneDayMs = 24 * 60 * 60 * 1000;
+  const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+  const rawRetentionMs = DELETE_RAW_DATA ? oneDayMs : threeDaysMs; // 根据DELETE_RAW_DATA决定已聚合原始数据保留时间
+  const rawRetentionAgo = now - rawRetentionMs;
   const oneDayAgo = now - oneDayMs;
   
   const rawCountResult = await db.prepare(`
@@ -302,28 +305,23 @@ async function aggregateFromRaw(db, startTime, endTime, bucketSeconds, phaseName
       AND timestamp < ?
   `).bind(startTime, endTime).all();
   
-  const idsToDeleteAlways = []; // 超过1天的，必须删除
-  const idsToDeleteOptional = []; // 1天内的，根据DELETE_RAW_DATA决定是否删除
+  const idsToDelete = []; // 只删除超过指定天数的已聚合数据，且不删除1天内的数据
   
   for (const row of toDeleteResult.results) {
     const bucket = Math.floor((row.timestamp + bucketMs / 2) / bucketMs) * bucketMs;
     const key = `${row.server_id}_${bucket}`;
-    if (existingKeys.has(key)) {
-      if (row.timestamp < oneDayAgo) {
-        idsToDeleteAlways.push(row.id);
-      } else {
-        idsToDeleteOptional.push(row.id);
-      }
+    if (existingKeys.has(key) && row.timestamp < rawRetentionAgo) {
+      idsToDelete.push(row.id);
     }
   }
   
   let deleted = 0;
   const batchSize = 500;
   
-  // 处理必须删除的（超过1天）
-  if (idsToDeleteAlways.length > 0) {
-    for (let i = 0; i < idsToDeleteAlways.length; i += batchSize) {
-      const batch = idsToDeleteAlways.slice(i, i + batchSize);
+  // 只删除超过指定天数的已聚合数据
+  if (idsToDelete.length > 0) {
+    for (let i = 0; i < idsToDelete.length; i += batchSize) {
+      const batch = idsToDelete.slice(i, i + batchSize);
       const placeholders = batch.map(() => '?').join(',');
       const deleteResult = await db.prepare(`
         DELETE FROM metrics_history WHERE id IN (${placeholders})
@@ -332,20 +330,8 @@ async function aggregateFromRaw(db, startTime, endTime, bucketSeconds, phaseName
     }
   }
   
-  // 处理可选删除的（1天内）
-  if (DELETE_RAW_DATA && idsToDeleteOptional.length > 0) {
-    for (let i = 0; i < idsToDeleteOptional.length; i += batchSize) {
-      const batch = idsToDeleteOptional.slice(i, i + batchSize);
-      const placeholders = batch.map(() => '?').join(',');
-      const deleteResult = await db.prepare(`
-        DELETE FROM metrics_history WHERE id IN (${placeholders})
-      `).bind(...batch).run();
-      deleted += deleteResult.meta.changes || 0;
-    }
-  }
-  
-  const totalToDelete = idsToDeleteAlways.length + idsToDeleteOptional.length;
-  const deleteStatus = `删除原始 ${deleted} 条（强制:${idsToDeleteAlways.length}, 可选:${DELETE_RAW_DATA ? idsToDeleteOptional.length : 0}/${idsToDeleteOptional.length}）`;
+  const retentionDaysText = DELETE_RAW_DATA ? '1天' : '3天';
+  const deleteStatus = `删除原始 ${deleted} 条（仅超过${retentionDaysText}的已聚合数据）`;
   console.log(`[Aggregate] ${phaseName}: 原始数据 ${rawCount} 条, 新增聚合 ${aggregated} 组, ${deleteStatus}`);
   
   return { aggregated, deleted, rawCount };
@@ -356,6 +342,9 @@ async function aggregateFromAggregated(db, startTime, endTime, targetBucketSecon
   const targetBucketMs = targetBucketSeconds * 1000;
   const now = Date.now();
   const oneDayMs = 24 * 60 * 60 * 1000;
+  const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+  const aggRetentionMs = DELETE_RAW_DATA ? oneDayMs : threeDaysMs; // 根据DELETE_RAW_DATA决定已聚合中间数据保留时间
+  const aggRetentionAgo = now - aggRetentionMs;
   const oneDayAgo = now - oneDayMs;
   
   const sourceCountResult = await db.prepare(`
@@ -432,28 +421,23 @@ async function aggregateFromAggregated(db, startTime, endTime, targetBucketSecon
       AND bucket < ?
   `).bind(sourceBucketSeconds, startTime, endTime).all();
   
-  const idsToDeleteAlways = []; // 超过1天的，必须删除
-  const idsToDeleteOptional = []; // 1天内的，根据DELETE_RAW_DATA决定是否删除
+  const idsToDelete = []; // 只删除超过指定天数的已聚合数据，且不删除1天内的数据
   
   for (const row of sourceToDeleteResult.results) {
     const targetBucket = Math.floor((row.bucket + targetBucketMs / 2) / targetBucketMs) * targetBucketMs;
     const key = `${row.server_id}_${targetBucket}`;
-    if (existingTargetKeys.has(key)) {
-      if (row.bucket < oneDayAgo) {
-        idsToDeleteAlways.push(row.id);
-      } else {
-        idsToDeleteOptional.push(row.id);
-      }
+    if (existingTargetKeys.has(key) && row.bucket < aggRetentionAgo) {
+      idsToDelete.push(row.id);
     }
   }
   
   let deleted = 0;
   const batchSize = 500;
   
-  // 处理必须删除的（超过1天）
-  if (idsToDeleteAlways.length > 0) {
-    for (let i = 0; i < idsToDeleteAlways.length; i += batchSize) {
-      const batch = idsToDeleteAlways.slice(i, i + batchSize);
+  // 只删除超过指定天数的已聚合数据
+  if (idsToDelete.length > 0) {
+    for (let i = 0; i < idsToDelete.length; i += batchSize) {
+      const batch = idsToDelete.slice(i, i + batchSize);
       const placeholders = batch.map(() => '?').join(',');
       const deleteResult = await db.prepare(`
         DELETE FROM metrics_aggregated WHERE id IN (${placeholders})
@@ -462,19 +446,8 @@ async function aggregateFromAggregated(db, startTime, endTime, targetBucketSecon
     }
   }
   
-  // 处理可选删除的（1天内）
-  if (DELETE_RAW_DATA && idsToDeleteOptional.length > 0) {
-    for (let i = 0; i < idsToDeleteOptional.length; i += batchSize) {
-      const batch = idsToDeleteOptional.slice(i, i + batchSize);
-      const placeholders = batch.map(() => '?').join(',');
-      const deleteResult = await db.prepare(`
-        DELETE FROM metrics_aggregated WHERE id IN (${placeholders})
-      `).bind(...batch).run();
-      deleted += deleteResult.meta.changes || 0;
-    }
-  }
-  
-  const deleteStatus = `删除源聚合 ${deleted} 条（强制:${idsToDeleteAlways.length}, 可选:${DELETE_RAW_DATA ? idsToDeleteOptional.length : 0}/${idsToDeleteOptional.length}）`;
+  const retentionDaysText = DELETE_RAW_DATA ? '1天' : '3天';
+  const deleteStatus = `删除源聚合 ${deleted} 条（仅超过${retentionDaysText}的已聚合数据）`;
   console.log(`[Aggregate] ${phaseName}: 源聚合数据 ${sourceCount} 条, 新增聚合 ${aggregated} 组, ${deleteStatus}`);
   
   return { aggregated, deleted, rawCount: sourceCount };
@@ -652,8 +625,9 @@ export async function cleanupOldData(db, enableLongRetention = false, force = fa
     const lastClean = await db.prepare(`SELECT value FROM settings WHERE key = 'last_cleanup'`).first();
     const now = Date.now();
     const oneHour = 60 * 60 * 1000;
-    const retentionHours = enableLongRetention ? (RETENTION_DAYS * 24) : 1;
-    const delDate = retentionHours * 60 * 60 * 1000; // 根据配置删除N小时前的原始数据
+    const oneDay = 24 * 60 * 60 * 1000;
+    const threeDays = 3 * 24 * 60 * 60 * 1000;
+    const rawRetentionDays = DELETE_RAW_DATA ? oneDay : threeDays; // 根据DELETE_RAW_DATA决定原始数据保留天数
     
     const shouldRun = force || !lastClean || (now - parseInt(lastClean.value)) > oneHour;
     
@@ -671,46 +645,63 @@ export async function cleanupOldData(db, enableLongRetention = false, force = fa
       phases: []
     };
     
+    // 删除旧格式数据
     const strDeleteResult = await db.prepare(
       `DELETE FROM metrics_history WHERE typeof(timestamp) = 'text'`
     ).run();
     stats.oldFormat = strDeleteResult.meta.changes || 0;
     
-    for (const phase of AGGREGATE_PHASES) {
-      const phaseStart = now - (phase.maxHours * 60 * 60 * 1000);
-      const phaseEnd = now - (phase.minHours * 60 * 60 * 1000);
-      
-      let phaseResult;
-      if (phase.sourceBucketSeconds === null) {
-        phaseResult = await aggregateFromRaw(
-          db, phaseStart, phaseEnd, phase.bucketSeconds, phase.name
-        );
-      } else {
-        phaseResult = await aggregateFromAggregated(
-          db, phaseStart, phaseEnd, phase.bucketSeconds, phase.sourceBucketSeconds, phase.name
-        );
+    // 当 enableLongRetention 为 true 时才执行聚合
+    if (enableLongRetention) {
+      for (const phase of AGGREGATE_PHASES) {
+        const phaseStart = now - (phase.maxHours * 60 * 60 * 1000);
+        const phaseEnd = now - (phase.minHours * 60 * 60 * 1000);
+        
+        let phaseResult;
+        if (phase.sourceBucketSeconds === null) {
+          phaseResult = await aggregateFromRaw(
+            db, phaseStart, phaseEnd, phase.bucketSeconds, phase.name
+          );
+        } else {
+          phaseResult = await aggregateFromAggregated(
+            db, phaseStart, phaseEnd, phase.bucketSeconds, phase.sourceBucketSeconds, phase.name
+          );
+        }
+        
+        stats.aggregated += phaseResult.aggregated;
+        stats.deleted += phaseResult.deleted;
+        stats.phases.push({
+          phase: phase.name,
+          ...phaseResult
+        });
       }
-      
-      stats.aggregated += phaseResult.aggregated;
-      stats.deleted += phaseResult.deleted;
-      stats.phases.push({
-        phase: phase.name,
-        ...phaseResult
-      });
+    } else {
+      console.log('[Cleanup] LONG_RETENTION 为 false，跳过数据聚合');
     }
     
-    const cutoff = now - delDate;
+    // 根据DELETE_RAW_DATA删除超过指定天数的原始数据
+    const rawCutoff = now - rawRetentionDays;
     const intDeleteResult = await db.prepare(
       `DELETE FROM metrics_history WHERE typeof(timestamp) = 'integer' AND timestamp < ?`
-    ).bind(cutoff).run();
+    ).bind(rawCutoff).run();
     stats.expired = intDeleteResult.meta.changes || 0;
     stats.deleted += stats.expired;
     
-    const aggCutoff = now - delDate;
-    const aggCleanResult = await db.prepare(
-      `DELETE FROM metrics_aggregated WHERE bucket < ?`
-    ).bind(aggCutoff).run();
-    stats.aggCleaned = aggCleanResult.meta.changes || 0;
+    // 处理聚合数据
+    if (enableLongRetention) {
+      // LONG_RETENTION=true：删除超过1天的聚合数据
+      const aggCutoff = now - oneDay;
+      const aggCleanResult = await db.prepare(
+        `DELETE FROM metrics_aggregated WHERE bucket < ?`
+      ).bind(aggCutoff).run();
+      stats.aggCleaned = aggCleanResult.meta.changes || 0;
+    } else {
+      // LONG_RETENTION=false：删除所有聚合数据
+      const aggCleanResult = await db.prepare(
+        `DELETE FROM metrics_aggregated`
+      ).run();
+      stats.aggCleaned = aggCleanResult.meta.changes || 0;
+    }
     
     const oneHourMs = 60 * 60 * 1000;
     const lastAggregatedTo = now - oneHourMs;
@@ -722,11 +713,13 @@ export async function cleanupOldData(db, enableLongRetention = false, force = fa
         INSERT OR REPLACE INTO settings (key, value) VALUES ('last_cleanup', ?)
       `).bind(now.toString()).run();
       
-      await db.prepare(`
-        INSERT OR REPLACE INTO settings (key, value) VALUES ('last_aggregated_to', ?)
-      `).bind(lastAggregatedTo.toString()).run();
+      if (enableLongRetention) {
+        await db.prepare(`
+          INSERT OR REPLACE INTO settings (key, value) VALUES ('last_aggregated_to', ?)
+        `).bind(lastAggregatedTo.toString()).run();
+      }
       
-      console.log(`[Cleanup] 聚合 ${stats.aggregated} 组, 清理 ${totalDeleted} 条（旧格式:${stats.oldFormat}, 过期原始:${stats.expired}, 过期聚合:${stats.aggCleaned}）, 聚合完成时间点:${new Date(lastAggregatedTo).toISOString()}`);
+      console.log(`[Cleanup] 聚合 ${stats.aggregated} 组, 清理 ${totalDeleted} 条（旧格式:${stats.oldFormat}, 过期原始:${stats.expired}, 过期聚合:${stats.aggCleaned}）`);
     }
     
     return {
@@ -737,7 +730,8 @@ export async function cleanupOldData(db, enableLongRetention = false, force = fa
       expired: stats.expired,
       aggCleaned: stats.aggCleaned,
       phases: stats.phases,
-      forced: force
+      forced: force,
+      longRetention: enableLongRetention
     };
   } catch (e) {
     console.error('[Cleanup] 清理数据失败:', e);
