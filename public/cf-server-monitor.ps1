@@ -20,8 +20,6 @@
     兼容参数。Windows PowerShell 版不使用 samples 采样缓存，始终按上报间隔采集并上报。
 .PARAMETER ReportInterval
     上报间隔（秒），默认 60
-.PARAMETER PingType
-    探测类型: http | tcp，默认 tcp
 .PARAMETER ResetDay
     流量重置日（1-31, 0=不重置），默认 1
 .PARAMETER RxCorrection
@@ -53,7 +51,6 @@ param(
     [string]$Url = "",
     [string]$CollectInterval = "0",
     [string]$ReportInterval = "60",
-    [string]$PingType = "tcp",
     [string]$ResetDay = "1",
     [string]$RxCorrection = "",
     [string]$TxCorrection = "",
@@ -79,7 +76,6 @@ if (-not $STA -and $host.Runspace.ApartmentState -ne 'STA') {
     if ($Url) { $argList += " -Url `"$Url`"" }
     if ($CollectInterval) { $argList += " -CollectInterval `"$CollectInterval`"" }
     if ($ReportInterval) { $argList += " -ReportInterval `"$ReportInterval`"" }
-    if ($PingType) { $argList += " -PingType `"$PingType`"" }
     if ($ResetDay) { $argList += " -ResetDay `"$ResetDay`"" }
     if ($RxCorrection) { $argList += " -RxCorrection `"$RxCorrection`"" }
     if ($TxCorrection) { $argList += " -TxCorrection `"$TxCorrection`"" }
@@ -224,21 +220,19 @@ function ConvertFrom-AgentConfigResponse {
     if ($ConfigMd5 -notmatch '^[a-f0-9]{32}$') { throw "动态配置 MD5 无效" }
     if ($Body -notmatch '^[a-z0-9_=&.\-]+$') { throw "动态配置包含非法字符" }
 
-    $expectedKeys = @('collect_interval', 'ping_mode', 'report_interval', 'reset_day', 'schema_version', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd')
     $parts = $Body.Split('&')
-    if ($parts.Count -lt $expectedKeys.Count) { throw "动态配置字段数量无效" }
+    if ($parts.Count -lt 8) { throw "动态配置字段数量无效" }
     $values = @{}
-    for ($i = 0; $i -lt [Math]::Min($parts.Count, $expectedKeys.Count); $i++) {
-        $pair = $parts[$i].Split('=')
-        if ($pair.Count -ne 2 -or $pair[0] -ne $expectedKeys[$i]) { throw "动态配置字段无效" }
-        $values[$pair[0]] = $pair[1]
-    }
-
-    for ($i = $expectedKeys.Count; $i -lt $parts.Count; $i++) {
-        $pair = $parts[$i].Split('=')
+    foreach ($part in $parts) {
+        $pair = $part.Split('=')
         if ($pair.Count -eq 2) {
             $values[$pair[0]] = $pair[1]
         }
+    }
+
+    $requiredKeys = @('collect_interval', 'report_interval', 'reset_day', 'schema_version', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd')
+    foreach ($key in $requiredKeys) {
+        if (-not $values.ContainsKey($key)) { throw "动态配置缺少必要字段: $key" }
     }
 
     foreach ($key in @('collect_interval', 'report_interval', 'reset_day', 'schema_version')) {
@@ -250,17 +244,15 @@ function ConvertFrom-AgentConfigResponse {
     $schema = [int]$values.schema_version
     if (@(0, 1, 2, 5, 10) -notcontains $collect) { throw "collect_interval 无效" }
     if (@(30, 60, 120, 180) -notcontains $report -or $report -lt $collect) { throw "report_interval 无效" }
-    if (@('http', 'tcp') -notcontains $values.ping_mode) { throw "ping_mode 无效" }
-    if ($reset -lt 0 -or $reset -gt 31 -or $schema -ne 1) { throw "reset_day 或 schema_version 无效" }
+    if ($reset -lt 0 -or $reset -gt 31 -or $schema -ne 2) { throw "reset_day 或 schema_version 无效" }
 
-    $canonical = "collect_interval=$collect&ping_mode=$($values.ping_mode)&report_interval=$report&reset_day=$reset&schema_version=$schema&custom_ct=$($values.custom_ct)&custom_cu=$($values.custom_cu)&custom_cm=$($values.custom_cm)&custom_bd=$($values.custom_bd)"
+    $canonical = "collect_interval=$collect&report_interval=$report&reset_day=$reset&schema_version=$schema&custom_ct=$($values.custom_ct)&custom_cu=$($values.custom_cu)&custom_cm=$($values.custom_cm)&custom_bd=$($values.custom_bd)"
     if ($Body -cne $canonical -and $Body -cne "$canonical&rx_correction=$($values.rx_correction)&tx_correction=$($values.tx_correction)") {
         throw "动态配置不是规范格式"
     }
 
     $result = @{
         collect_interval = $collect
-        ping_type = $values.ping_mode
         report_interval = $report
         reset_day = $reset
         config_md5 = $ConfigMd5
@@ -299,7 +291,6 @@ function Invoke-AsAdmin {
     if ($Secret) { $argList += " -Secret `"$Secret`"" }
     if ($Url) { $argList += " -Url `"$Url`"" }
     if ($ReportInterval -and $ReportInterval -ne "60") { $argList += " -ReportInterval `"$ReportInterval`"" }
-    if ($PingType -and $PingType -ne "tcp") { $argList += " -PingType `"$PingType`"" }
     if ($ResetDay -and $ResetDay -ne "1") { $argList += " -ResetDay `"$ResetDay`"" }
     if ($RxCorrection) { $argList += " -RxCorrection `"$RxCorrection`"" }
     if ($TxCorrection) { $argList += " -TxCorrection `"$TxCorrection`"" }
@@ -469,24 +460,6 @@ function Get-LoadAvg {
 # 网络探测
 # ============================================================
 
-function Get-HttpPing {
-    param([string]$TargetHost)
-    if (-not $TargetHost) { return "" }
-    try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $req = [System.Net.HttpWebRequest]::Create("http://$TargetHost")
-        $req.Timeout = 1500
-        $req.Method = "HEAD"
-        $req.AllowAutoRedirect = $false
-        try { $resp = $req.GetResponse(); $resp.Close() } catch {}
-        $sw.Stop()
-        $ms = [int]$sw.ElapsedMilliseconds
-        return if ($ms -gt 0) { $ms.ToString() } else { "1" }
-    } catch {
-        return ""
-    }
-}
-
 function Get-TcpPing {
     param([string]$TargetHost, [int]$Port = 443) 
     if (-not $TargetHost) { return "" }
@@ -509,36 +482,18 @@ function Get-TcpPing {
 }
 
 
-function Get-Ping {
-    param([string]$TargetHost, [string]$PingType = "tcp")
+function Get-Probe {
+    param([string]$TargetHost, [int]$Count = 4)
     $TargetHost = $TargetHost.Trim()
-    if (-not $TargetHost) { 
-        return "" 
+    if (-not $TargetHost) { return @{ rtt = ""; loss = "" } }
+    $ok = 0; $totalRtt = 0
+    for ($i = 0; $i -lt $Count; $i++) {
+        $r = Get-TcpPing -TargetHost $TargetHost
+        if ($r -match '^\d+$') { $ok++; $totalRtt += [int]$r }
     }
-    if ($PingType -eq "http") { 
-        $result = Get-HttpPing -TargetHost $TargetHost
-        return $result
-    }
-    $result = Get-TcpPing -TargetHost $TargetHost
-    return $result
-}
-
-function Get-PacketLoss {
-    param([string]$TargetHost, [int]$Count = 5) 
-    $TargetHost = $TargetHost.Trim()
-    if (-not $TargetHost) { return "" }
-    try {
-        $result = ping -n $Count -w 1000 $TargetHost 2>$null
-        $lossLine = $result | Select-String "(?:Lost|丢失)\s*=\s*(\d+)"
-        if ($lossLine) {
-            $lost = [int]$lossLine.Matches[0].Groups[1].Value
-            $pct = [math]::Round(($lost / $Count) * 100)
-            return $pct.ToString()
-        }
-    } catch {
-        Write-Log "Get-PacketLoss: $TargetHost 异常: $_" "DEBUG"
-    }
-    return ""
+    $rtt = if ($ok -gt 0) { [math]::Floor($totalRtt / $ok).ToString() } else { "0" }
+    $loss = [math]::Floor(($Count - $ok) / $Count * 100).ToString()
+    return @{ rtt = $rtt; loss = $loss }
 }
 
 # ============================================================
@@ -551,63 +506,55 @@ function Start-PingBackgroundJob {
         [string]$CuNode,
         [string]$CmNode,
         [string]$BdNode,
-        [string]$PingType,
         [string]$TempFile
     )
 
     $jobScript = {
-        param($ct, $cu, $cm, $bd, $pingType, $tempFile)
+        param($ct, $cu, $cm, $bd, $tempFile)
 
-        function Get-Ping {
-            param([string]$TargetHost, [string]$PingType)
-            $TargetHost = $TargetHost.Trim()
+        function Get-TcpPing {
+            param([string]$TargetHost, [int]$Port = 443)
             if (-not $TargetHost) { return "" }
             try {
-                if ($PingType -eq "http") {
-                    $request = [System.Net.WebRequest]::Create("http://${TargetHost}/")
-                    $request.Timeout = 3000
-                    $request.Method = "HEAD"
-                    $start = [DateTime]::Now
-                    $response = $request.GetResponse()
-                    $response.Close()
-                    $duration = [math]::Round(([DateTime]::Now - $start).TotalMilliseconds)
-                    return $duration.ToString()
-                } else {
-                    $tcp = New-Object System.Net.Sockets.TCPClient
-                    $tcp.SendTimeout = 3000
-                    $tcp.ReceiveTimeout = 3000
-                    $start = [DateTime]::Now
-                    $tcp.Connect($TargetHost, 443)
-                    $duration = [math]::Round(([DateTime]::Now - $start).TotalMilliseconds)
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $task = $tcp.ConnectAsync($TargetHost, $Port)
+                if ($task.Wait(5000)) {
+                    $sw.Stop()
                     $tcp.Close()
-                    return $duration.ToString()
+                    $ms = [int]$sw.ElapsedMilliseconds
+                    if ($ms -gt 0) { return $ms.ToString() } else { return "1" }
+                } else {
+                    $tcp.Close()
+                    return ""
                 }
-            } catch {
-                return ""
-            }
+            } catch { return "" }
         }
 
-        function Get-PacketLoss {
-            param([string]$TargetHost, [string]$PingType, [int]$Count = 4)
+        function Get-Probe {
+            param([string]$TargetHost, [int]$Count = 4)
             $TargetHost = $TargetHost.Trim()
-            if (-not $TargetHost) { return "" }
-            $ok = 0
+            if (-not $TargetHost) { return @{ rtt = ""; loss = "" } }
+            $ok = 0; $totalRtt = 0
             for ($i = 0; $i -lt $Count; $i++) {
-                $r = Get-Ping -TargetHost $TargetHost -PingType $PingType
-                if ($r -match '^\d+$') { $ok++ }
+                $r = Get-TcpPing -TargetHost $TargetHost
+                if ($r -match '^\d+$') { $ok++; $totalRtt += [int]$r }
             }
-            return [math]::Round(($Count - $ok) / $Count * 100).ToString()
+            $rtt = if ($ok -gt 0) { [math]::Floor($totalRtt / $ok).ToString() } else { "0" }
+            $loss = [math]::Floor(($Count - $ok) / $Count * 100).ToString()
+            return @{ rtt = $rtt; loss = $loss }
         }
+
+        $ctProbe = Get-Probe -TargetHost $ct
+        $cuProbe = Get-Probe -TargetHost $cu
+        $cmProbe = Get-Probe -TargetHost $cm
+        $bdProbe = Get-Probe -TargetHost $bd
 
         $result = @{
-            ct_ping = Get-Ping -TargetHost $ct -PingType $pingType
-            cu_ping = Get-Ping -TargetHost $cu -PingType $pingType
-            cm_ping = Get-Ping -TargetHost $cm -PingType $pingType
-            bd_ping = Get-Ping -TargetHost $bd -PingType $pingType
-            ct_loss = Get-PacketLoss -TargetHost $ct -PingType $pingType
-            cu_loss = Get-PacketLoss -TargetHost $cu -PingType $pingType
-            cm_loss = Get-PacketLoss -TargetHost $cm -PingType $pingType
-            bd_loss = Get-PacketLoss -TargetHost $bd -PingType $pingType
+            ct_ping = $ctProbe.rtt; ct_loss = $ctProbe.loss
+            cu_ping = $cuProbe.rtt; cu_loss = $cuProbe.loss
+            cm_ping = $cmProbe.rtt; cm_loss = $cmProbe.loss
+            bd_ping = $bdProbe.rtt; bd_loss = $bdProbe.loss
             timestamp = [DateTimeOffset]::Now.ToUnixTimeSeconds()
         }
 
@@ -615,7 +562,7 @@ function Start-PingBackgroundJob {
         [System.IO.File]::WriteAllText($tempFile, $json, [System.Text.Encoding]::UTF8)
     }
 
-    $jobArgs = @($CtNode, $CuNode, $CmNode, $BdNode, $PingType, $TempFile)
+    $jobArgs = @($CtNode, $CuNode, $CmNode, $BdNode, $TempFile)
     Start-Job -ScriptBlock $jobScript -ArgumentList $jobArgs -Name "CFProbePingJob" | Out-Null
 }
 
@@ -923,7 +870,6 @@ function Start-TimerCollectLoop {
             worker_url = $Url
             collect_interval = [int]$CollectInterval
             report_interval = [int]$ReportInterval
-            ping_type = $PingType
             reset_day = [int]$ResetDay
             config_md5 = "none"
             ct_node = if ($CtNode) { $CtNode } else { $DEFAULT_CT }
@@ -943,12 +889,6 @@ function Start-TimerCollectLoop {
         $reportInterval = [int]$config.report_interval
     } else {
         $reportInterval = 60
-    }
-
-    if ($config.ping_type) {
-        $pingType = $config.ping_type
-    } else {
-        $pingType = "tcp"
     }
 
     if ($null -ne $config.reset_day) {
@@ -981,7 +921,6 @@ function Start-TimerCollectLoop {
         return
     }
     if (@(30, 60, 120, 180) -notcontains $reportInterval) { $reportInterval = 60 }
-    if (@('http', 'tcp') -notcontains $pingType) { $pingType = 'tcp' }
     if ($resetDay -lt 0 -or $resetDay -gt 31) { $resetDay = 1 }
     $effectiveReportInterval = [math]::Max($reportInterval, 60)
 
@@ -1003,7 +942,6 @@ function Start-TimerCollectLoop {
     $script:cs_lossBd = ""
     $script:cs_lastReportTime = 0
     $script:cs_reportInterval = $effectiveReportInterval
-    $script:cs_pingType = $pingType
     $script:cs_resetDay = $resetDay
     $script:cs_configMd5 = $configMd5
 
@@ -1033,7 +971,6 @@ function Start-TimerCollectLoop {
             $cuN = if ($config.cu_node) { $config.cu_node } else { $cuNode }
             $cmN = if ($config.cm_node) { $config.cm_node } else { $cmNode }
             $bdN = if ($config.bd_node) { $config.bd_node } else { $bdNode }
-            $pType = $script:cs_pingType
             $rDay = $script:cs_resetDay
             $rInterval = $script:cs_reportInterval
             $pFile = $pingTempFile
@@ -1047,13 +984,13 @@ function Start-TimerCollectLoop {
                 $script:cs_lastIpCheck = $now
             }
 
-            # Ping 检测（每 30 秒，异步执行）
+            # Ping 每 30 秒检测一次（同时计算延迟和丢包率）
             if ($now - $script:cs_lastPingCheck -ge 30 -or $script:cs_lastPingCheck -eq 0) {
                 $script:cs_lastPingCheck = $now
                 $existingJob = Get-Job -Name "CFProbePingJob" -ErrorAction SilentlyContinue
                 if (-not $existingJob -or $existingJob.State -in @("Completed", "Failed", "Stopped")) {
                     Remove-PingBackgroundJob
-                    Start-PingBackgroundJob -CtNode $ctN -CuNode $cuN -CmNode $cmN -BdNode $bdN -PingType $pType -TempFile $pFile
+                    Start-PingBackgroundJob -CtNode $ctN -CuNode $cuN -CmNode $cmN -BdNode $bdN -TempFile $pFile
                 }
             }
 
@@ -1149,7 +1086,7 @@ function Start-TimerCollectLoop {
                 $json = $payload | ConvertTo-Json -Depth 10 -Compress
                 try {
                     $requestHeaders = @{
-                        'X-Agent-Config-Schema' = '1'
+                        'X-Agent-Config-Schema' = '2'
                         'X-Agent-Config-Md5' = if ($script:cs_configMd5) { $script:cs_configMd5 } else { 'none' }
                     }
                     $response = Invoke-WebRequest -UseBasicParsing -Uri $wUrl -Method Post -Body $json `
@@ -1179,7 +1116,6 @@ function Start-TimerCollectLoop {
                             if ($configApplied) {
                                 $effectiveRemoteReportInterval = [math]::Max($remoteConfig.report_interval, 60)
                                 $script:cs_reportInterval = $effectiveRemoteReportInterval
-                                $script:cs_pingType = $remoteConfig.ping_type
                                 $script:cs_resetDay = $remoteConfig.reset_day
                                 $script:cs_configMd5 = $remoteConfig.config_md5
                                 if ($remoteConfig.ContainsKey('ct_node')) { $script:cs_ctNode = $remoteConfig.ct_node }
@@ -1209,7 +1145,7 @@ function Start-TimerCollectLoop {
                                 $newCuNode = if ($remoteConfig.ContainsKey('cu_node')) { $remoteConfig.cu_node } else { $config.cu_node }
                                 $newCmNode = if ($remoteConfig.ContainsKey('cm_node')) { $remoteConfig.cm_node } else { $config.cm_node }
                                 $newBdNode = if ($remoteConfig.ContainsKey('bd_node')) { $remoteConfig.bd_node } else { $config.bd_node }
-                                Start-PingBackgroundJob -CtNode $newCtNode -CuNode $newCuNode -CmNode $newCmNode -BdNode $newBdNode -PingType $remoteConfig.ping_type -TempFile $pingTempFile
+                                Start-PingBackgroundJob -CtNode $newCtNode -CuNode $newCuNode -CmNode $newCmNode -BdNode $newBdNode -TempFile $pingTempFile
                             }
                         }
 
@@ -1272,7 +1208,6 @@ function Install-Service {
         worker_url = if ($cleanUrl) { $cleanUrl } elseif ($existingConfig) { $existingConfig.worker_url } else { "" }
         collect_interval = [int]$CollectInterval
         report_interval = [int]$ReportInterval
-        ping_type = $PingType
         reset_day = [int]$ResetDay
         config_md5 = "none"
         ct_node = if ($CtNode) { $CtNode } elseif ($existingConfig -and $existingConfig.ct_node) { $existingConfig.ct_node } else { $DEFAULT_CT }
@@ -1362,7 +1297,6 @@ function Install-Service {
     Write-Host "  上报间隔   : $($config.report_interval)秒"
     Write-Host "  实际间隔   : $effectiveInstallReportInterval秒"
     Write-Host "  采样间隔   : Windows PowerShell 版不启用 samples 缓存"
-    Write-Host "  探测类型   : $($config.ping_type)"
     Write-Host "  流量重置日 : $($config.reset_day)号"
     Write-Host "  配置文件   : $CONFIG_FILE"
     Write-Host "  日志文件   : $LOG_FILE"
