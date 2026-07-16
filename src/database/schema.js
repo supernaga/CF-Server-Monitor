@@ -197,9 +197,9 @@ export async function getMetricsHistory(db, serverId, hours, columns, server = n
     return cached.data;
   }
   
-  // 最多返回80个数据点,前端需要配合这个计算断点阈值
+  // 最多返回160个数据点,前端需要配合这个计算断点阈值
   const queryHours = Math.min(hours, 168);
-  const MAX_POINTS = 80;
+  const MAX_POINTS = 160;
   const totalMs = queryHours * 60 * 60 * 1000;
   const intervalMs = Math.max(10_000, Math.ceil(totalMs / MAX_POINTS));
 
